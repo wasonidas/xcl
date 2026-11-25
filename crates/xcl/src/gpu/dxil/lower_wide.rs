@@ -102,6 +102,7 @@ impl Lw {
             }
             "v_dot4_u32_u8" => Some(self.dot_n(src(0), src(1), src(2), 8, false, clamp)),
             "v_dot4_i32_i8" => Some(self.dot_n(src(0), src(1), src(2), 8, true, clamp)),
+            "v_dot8_u32_u4" if !clamp => Some(self.dot8_u4_wrapping(src(0), src(1), src(2))),
             "v_dot8_u32_u4" => Some(self.dot_n(src(0), src(1), src(2), 4, false, clamp)),
             "v_dot8_i32_i4" => Some(self.dot_n(src(0), src(1), src(2), 4, true, clamp)),
             _ => None,
@@ -218,6 +219,19 @@ impl Lw {
         let r = self.or(halves[0], hi);
         self.write32(&dst, r);
         Ok(())
+    }
+
+    /// Wrapping `v_dot8_u32_u4`: split even and odd 4-bit nibbles into zero-padded bytes
+    /// and chain two unsigned `dot4AddPacked` ops on the modular accumulator.
+    fn dot8_u4_wrapping(&mut self, a: Value, b: Value, c: Value) -> Value {
+        let a_even = self.andc(a, 0x0f0f_0f0f);
+        let b_even = self.andc(b, 0x0f0f_0f0f);
+        let acc = self.s.dot4_add_packed(a_even, b_even, c, false);
+        let a_odd = self.lshrc(a, 4);
+        let a_odd = self.andc(a_odd, 0x0f0f_0f0f);
+        let b_odd = self.lshrc(b, 4);
+        let b_odd = self.andc(b_odd, 0x0f0f_0f0f);
+        self.s.dot4_add_packed(a_odd, b_odd, acc, false)
     }
 
     /// dot4_u8 / dot4_i8 / dot8_u4 / dot8_i4: c + Σ a[i]·b[i] over `bits`-wide fields.
@@ -1338,5 +1352,133 @@ mod cmp64_tests {
         validate::validate(&dxil).expect("dxil validate");
         let dis = validate::disassemble(&dxil).expect("dxil disassemble");
         assert!(!dis.lines().any(|l| l.contains("icmp ") && l.contains(" i64 ")), "found i64 icmp in carry ops:\n{dis}");
+    }
+}
+
+#[cfg(test)]
+mod dot8_tests {
+    use crate::gpu::dxil::{kernel, validate};
+    use crate::gpu::rdna2;
+    use crate::gpu::recomp::runner::{self, KernelState};
+
+    const V: u64 = 256;
+
+    fn asm(list: &[(&str, &[(&str, u64)])]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for &(name, fields) in list {
+            code.extend(rdna2::encode(name, "ENC_VOP3P", fields, None).unwrap_or_else(|e| panic!("encode {name}: {e}")));
+        }
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    fn cpu_dot8_u4(a: u32, b: u32, c: u32, clamp: bool) -> u32 {
+        let mut sum = c as u64;
+        for i in 0..8 {
+            let na = ((a >> (4 * i)) & 0xF) as u64;
+            let nb = ((b >> (4 * i)) & 0xF) as u64;
+            sum += na * nb;
+        }
+        if clamp {
+            sum.min(u32::MAX as u64) as u32
+        } else {
+            sum as u32
+        }
+    }
+
+    #[test]
+    fn dot8_u32_u4_wrapping_emits_two_unsigned_dot4_add_packed() {
+        let opts = kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+
+        let wrap_code = asm(&[("V_DOT8_U32_U4", &[("VDST", 3), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)])]);
+        let wrap_dxil = kernel::translate(&wrap_code, opts).expect("direct translate wrapping v_dot8_u32_u4");
+        validate::validate(&wrap_dxil).expect("dxil validate wrapping v_dot8_u32_u4");
+        let dis = validate::disassemble(&wrap_dxil).expect("dxil disassemble wrapping v_dot8_u32_u4");
+
+        let dot_calls: Vec<&str> = dis.lines().filter(|l| l.contains("@dx.op.dot4AddPacked.i32(i32 164,")).collect();
+        assert_eq!(dot_calls.len(), 2, "expected 2 unsigned dot4AddPacked calls:\n{dis}");
+        assert!(!dis.contains("@dx.op.dot4AddPacked.i32(i32 163,"), "unexpected signed dot4AddPacked:\n{dis}");
+        assert!(dis.contains("and i32") && dis.contains("252645135"), "expected 0x0f0f0f0f nibble mask:\n{dis}");
+        assert!(dis.contains("lshr i32") && dis.contains(", 4"), "expected lshr by 4 for odd nibbles:\n{dis}");
+
+        let first_ssa = dot_calls[0].split('=').next().unwrap().trim();
+        let expected_chain = format!("(i32 164, i32 {first_ssa},");
+        assert!(dot_calls[1].contains(&expected_chain), "second dot4AddPacked did not chain accumulator {first_ssa}:\n{}\n{}", dot_calls[0], dot_calls[1]);
+
+        let clamp_code = asm(&[("V_DOT8_U32_U4", &[("VDST", 3), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)])]);
+        let clamp_dxil = kernel::translate(&clamp_code, opts).expect("direct translate clamped v_dot8_u32_u4");
+        validate::validate(&clamp_dxil).expect("dxil validate clamped v_dot8_u32_u4");
+        let clamp_dis = validate::disassemble(&clamp_dxil).expect("dxil disassemble clamped v_dot8_u32_u4");
+        assert!(!clamp_dis.contains("dot4AddPacked"), "clamped v_dot8_u32_u4 must keep saturating path:\n{clamp_dis}");
+
+        let signed_code = asm(&[("V_DOT8_I32_I4", &[("VDST", 3), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)])]);
+        let signed_dxil = kernel::translate(&signed_code, opts).expect("direct translate wrapping v_dot8_i32_i4");
+        validate::validate(&signed_dxil).expect("dxil validate wrapping v_dot8_i32_i4");
+        let signed_dis = validate::disassemble(&signed_dxil).expect("dxil disassemble wrapping v_dot8_i32_i4");
+        assert!(!signed_dis.contains("dot4AddPacked"), "v_dot8_i32_i4 must stay on existing path:\n{signed_dis}");
+    }
+
+    #[test]
+    fn dot8_u32_u4_wrapping_and_clamped_match_cpu_oracle_on_gpu() {
+        let wave64 = match (runner::adapter(), runner::wave64_programs_supported(), runner::wave32_supported()) {
+            (Err(_), _, _) => return runner::skip_test("no GPU"),
+            (_, Ok(true), _) => true,
+            (_, _, Ok(true)) => false,
+            _ => return runner::skip_test("neither wave64 nor wave32 support"),
+        };
+
+        let code = asm(&[
+            ("V_DOT8_U32_U4", &[("VDST", 3), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)]),
+            ("V_DOT8_U32_U4", &[("VDST", 4), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)]),
+            ("V_DOT8_U32_U4", &[("VDST", 5), ("SRC0", V + 0), ("SRC1", V + 0), ("SRC2", V + 3)]),
+        ]);
+        let k = runner::direct_kernel_full(&code, wave64).expect("direct translate");
+        validate::validate(&k.dxil).expect("dxil validate");
+
+        let mut cases: Vec<(u32, u32, u32)> = vec![
+            (0x0000_0000, 0x0000_0000, 0x0000_0000),
+            (0xFFFF_FFFF, 0xFFFF_FFFF, 0x0000_0000),
+            (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF),
+            (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_F8F7), // max dot = 1800 = 0x708 -> 0xFFFF_FFFF (no wrap)
+            (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_F8F8), // 0xFFFF_F8F8 + 0x708 = 0 (wrap vs clamp)
+            (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FC00), // even sum (900) stays below wrap, odd sum wraps
+            (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FE00), // even sum wraps, odd sum adds after wrap
+            (0x0F0F_0F0F, 0xF0F0_F0F0, 0x1234_5678), // disjoint nibbles -> dot = 0
+            (0xF0F0_F0F0, 0x0F0F_0F0F, 0xFFFF_FFFF), // disjoint nibbles -> dot = 0
+            (0x0F0F_0F0F, 0x0F0F_0F0F, 0xFFFF_FE00), // even nibbles only, wraps
+            (0xF0F0_F0F0, 0xF0F0_F0F0, 0xFFFF_FE00), // odd nibbles only, wraps
+            (0x1234_5678, 0x8765_4321, 0x0000_0001),
+            (0xFEDC_BA98, 0x0123_4567, 0xFFFF_FFFE),
+        ];
+        // Isolate every single nibble position (0..7)
+        for nib in 0..8u32 {
+            let a = (nib + 1) << (nib * 4);
+            let b = (15 - nib) << (nib * 4);
+            cases.push((a, b, 0xFFFF_FFFD));
+        }
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 32) as u32
+        };
+        while cases.len() < 64 {
+            cases.push((next(), next(), next()));
+        }
+
+        let mut st = KernelState::default();
+        for (l, &(a, b, c)) in cases.iter().enumerate() {
+            st.vgpr[l][0] = a;
+            st.vgpr[l][1] = b;
+            st.vgpr[l][2] = c;
+        }
+        let res = runner::run_with_statics(&k.dxil, &st, &[], &[], &[], &k.static_samplers).expect("GPU run");
+        for (l, &(a, b, c)) in cases.iter().enumerate() {
+            let want_wrap = cpu_dot8_u4(a, b, c, false);
+            let want_clamp = cpu_dot8_u4(a, b, c, true);
+            let want_chain = cpu_dot8_u4(a, a, want_wrap, false);
+            assert_eq!(res.vgpr[l][3], want_wrap, "lane {l} wrap mismatch for a={a:#010x} b={b:#010x} c={c:#010x}");
+            assert_eq!(res.vgpr[l][4], want_clamp, "lane {l} clamp mismatch for a={a:#010x} b={b:#010x} c={c:#010x}");
+            assert_eq!(res.vgpr[l][5], want_chain, "lane {l} chained wrap mismatch for a={a:#010x} acc={want_wrap:#010x}");
+        }
     }
 }

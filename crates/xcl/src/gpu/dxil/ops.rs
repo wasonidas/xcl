@@ -383,6 +383,13 @@ impl Shader {
         self.op(op as u32, "tertiary", Some(t), t, &[a, b, c], FnAttrs::ReadNone)
     }
 
+    /// Dot product of four packed bytes, added to a wrapping i32 accumulator.
+    pub fn dot4_add_packed(&mut self, a: Value, b: Value, acc: Value, signed: bool) -> Value {
+        let i32 = self.m.i32();
+        let op = if signed { 163 } else { 164 };
+        self.op(op, "dot4AddPacked", Some(i32), i32, &[acc, a, b], FnAttrs::ReadNone)
+    }
+
     /// `Bfi(width, offset, value, replaced)` (i32): inserts the low `width`
     /// bits of `value` into `replaced` at `offset`.
     pub fn bfi(&mut self, width: Value, offset: Value, value: Value, replaced: Value) -> Value {
