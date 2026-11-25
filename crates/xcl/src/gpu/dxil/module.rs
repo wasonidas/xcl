@@ -1427,6 +1427,14 @@ impl Module {
             ops.into_iter().any(|v| self.value_ty(v) == t)
         })
     }
+    /// True if any surviving `dx.op.tertiary.i32` call is `Msad` (opcode 50).
+    pub fn uses_msad(&self) -> bool {
+        self.blocks.iter().flatten().any(|&i| {
+            let Op::Call(f, args) = &self.insts[i as usize].op else { return false };
+            self.funcs[*f as usize].name == "dx.op.tertiary.i32"
+                && args.first().and_then(|&op| self.const_u64(op)) == Some(50)
+        })
+    }
     /// True if any surviving `dx.op.annotateHandle` call carries the `IsROV` flag (`0x2000`).
     pub fn has_rov_handle(&self) -> bool {
         self.blocks.iter().flatten().any(|&i| {

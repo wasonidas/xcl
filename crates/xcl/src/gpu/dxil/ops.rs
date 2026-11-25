@@ -110,6 +110,9 @@ pub enum Tertiary {
     Fma = 47,
     IMad = 48,
     UMad = 49,
+    /// `Msad(ref, src, accum)` (i32): masked sum of absolute byte differences
+    /// (zero bytes in `ref` are skipped; needs `ShaderExtensions11_1`).
+    Msad = 50,
     /// `Ibfe(width, offset, value)` (i32): signed bitfield extract; width and
     /// offset use their low 5 bits.
     Ibfe = 51,
@@ -368,9 +371,13 @@ impl Shader {
         self.op(op as u32, "binary", Some(t), t, &[a, b], FnAttrs::ReadNone)
     }
 
-    /// `FMad`, `Fma`, `IMad`, `UMad`, `Ibfe`, `Ubfe`.
+    /// `FMad`, `Fma`, `IMad`, `UMad`, `Msad`, `Ibfe`, `Ubfe`.
     pub fn tertiary(&mut self, op: Tertiary, a: Value, b: Value, c: Value) -> Value {
         let t = self.m.type_of(a);
+        if op == Tertiary::Msad {
+            debug_assert_eq!(t, self.m.i32(), "Msad is i32 only");
+            self.require(Feature::ShaderExtensions11_1);
+        }
         if self.is_f64(a) {
             self.require(Feature::Doubles);
         }

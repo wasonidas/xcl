@@ -363,17 +363,11 @@ impl Lw {
         r
     }
     pub fn msad_u8(&mut self, a: Value, b: Value) -> Value {
-        let mut r = self.c(0);
-        for k in [0, 8, 16, 24] {
-            let x = self.absd(a, b, k, 0xFF);
-            let bb = self.lshrc(b, k);
-            let bb = self.andc(bb, 0xFF);
-            let nz = self.nz(bb);
-            let z = self.c(0);
-            let x = self.sel(nz, x, z);
-            r = self.add(r, x);
-        }
-        r
+        let z = self.c(0);
+        // DXIL `Msad(ref, src, accum)`: RDNA `src1` (`b`) is the reference/mask,
+        // `src0` (`a`) is the data, and `accum = 0` keeps the intrinsic sum in
+        // `0..=1020` so the caller's `add` preserves modular u32 wrapping.
+        self.s.tertiary(super::ops::Tertiary::Msad, b, a, z)
     }
     pub fn lerp_u8(&mut self, a: Value, b: Value, c: Value) -> Value {
         let mut r = self.c(0);

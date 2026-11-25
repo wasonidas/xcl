@@ -30,6 +30,8 @@ pub enum Feature {
     AtomicInt64Heap,
     /// `fma`, double division / reciprocal (D3D11.1 double extensions).
     DoubleExtensions,
+    /// `Msad` (D3D11.1 shader extensions).
+    ShaderExtensions11_1,
     /// Sample/gather with a `clamp` operand (min-LOD), CheckAccessFullyMapped.
     TiledResources,
     /// Typed UAV loads of multi-component / non-32-bit formats.
@@ -58,6 +60,7 @@ impl Feature {
             Feature::SamplerHeapIndexing => 31,
             Feature::AtomicInt64Heap => 32,
             Feature::DoubleExtensions => 6,
+            Feature::ShaderExtensions11_1 => 7,
             Feature::TiledResources => 12,
             Feature::TypedUavLoadAdditionalFormats => 13,
         }
@@ -77,6 +80,7 @@ impl Feature {
             Feature::SamplerHeapIndexing => 0x400_0000,
             Feature::AtomicInt64Heap => 0x1000_0000,
             Feature::DoubleExtensions => 0x20,
+            Feature::ShaderExtensions11_1 => 0x40,
             Feature::TiledResources => 0x100,
             Feature::TypedUavLoadAdditionalFormats => 0x800,
         }
@@ -493,6 +497,10 @@ impl Shader {
         }
         if self.m.uses_double_extensions() {
             self.require(Feature::DoubleExtensions);
+        }
+        // Check for dead calls only if the emitter marked the shader as using Msad.
+        if self.features.contains(&Feature::ShaderExtensions11_1) && !self.m.uses_msad() {
+            self.features.remove(&Feature::ShaderExtensions11_1);
         }
         if self.bindings.iter().any(|b| b.rov) || self.m.has_rov_handle() {
             self.require(Feature::Rovs);
